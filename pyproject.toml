@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "data-analyst-agent"
+version = "0.0.1"
+description = "Python SDK for embedding conversational data analysis (NL → SQL → result → conclusion) into applications"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "TBD" }
+authors = [{ name = "data-analyst-agent contributors" }]
+keywords = ["nl2sql", "agent", "data-analysis", "llm", "sdk"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.0",
+    "mypy>=1.10",
+    "ruff>=0.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/cathy0023/data-analyst-agent"
+Repository = "https://github.com/cathy0023/data-analyst-agent"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/data_analyst_agent"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/", "tests/", "README.md", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "C4", "SIM"]
