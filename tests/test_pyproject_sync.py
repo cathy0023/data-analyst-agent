@@ -1,8 +1,9 @@
 """AC-18: pyproject.toml dependencies match RFC DATA-001 §Implementation/Dependencies."""
 
 import re
-import tomllib
 from pathlib import Path
+
+import tomllib
 
 PYPROJECT = Path(__file__).parent.parent / "pyproject.toml"
 
@@ -40,7 +41,7 @@ def _load_pyproject() -> dict:
 def _extract_dep_names(deps: list[str]) -> set[str]:
     names: set[str] = set()
     for d in deps:
-        # Strip environment markers (; python_version<'3.12'), extras ([binary,pool]), version constraints
+        # Strip env markers, extras, and version constraints from the spec
         name = _DEP_NAME_RE.split(d, maxsplit=1)[0]
         if name:
             names.add(name)

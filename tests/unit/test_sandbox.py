@@ -17,7 +17,6 @@ from data_analyst_agent.executor.sandbox import (
     validate_sql_with_limit,
 )
 
-
 # === Allow-list acceptance ===
 
 

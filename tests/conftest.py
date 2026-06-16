@@ -4,9 +4,8 @@ pytest-postgresql provides a `postgresql` fixture (a running PG instance per tes
 We seed a tiny schema so list_tables/get_table_schema tests have content.
 """
 
-import pytest
-import pytest_asyncio
 import psycopg
+import pytest
 from pytest_postgresql import factories
 
 # PG binary is provided by pytest-postgresql plugin (uses pg_ctl from PATH).

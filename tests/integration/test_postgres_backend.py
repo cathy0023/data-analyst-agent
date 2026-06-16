@@ -1,4 +1,4 @@
-"""AC-5/AC-6: PostgresBackend — connect/close/list_tables/get_table_schema + DSN statement_timeout."""
+"""AC-5/AC-6: PostgresBackend — connect/close/list_tables/get_table_schema + DSN timeout."""
 
 import time
 

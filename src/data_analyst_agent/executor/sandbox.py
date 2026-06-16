@@ -58,8 +58,8 @@ def _inject_limit(parsed: exp.Expression, row_limit: int) -> exp.Expression:
             select.set("limit", exp.Limit(expression=exp.Literal.number(row_limit)))
         else:
             try:
-                limit_expr = existing.expression  # type: ignore[union-attr]
-                current = int(limit_expr.name)  # type: ignore[union-attr]
+                limit_expr = existing.expression
+                current = int(limit_expr.name)
             except (AttributeError, ValueError):
                 continue
             if current > row_limit:

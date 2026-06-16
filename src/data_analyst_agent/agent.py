@@ -42,7 +42,9 @@ class DataAnalyst:
     def __init__(self, *, db_url: str, settings: Settings | None = None) -> None:
         # Fail-fast on missing API key. Settings() raises if env is unset.
         try:
-            self._settings = settings or Settings(db_url=db_url)
+            # anthropic_api_key is required by Settings but populated from env
+            # via pydantic-settings; mypy can't see env resolution, hence ignore.
+            self._settings = settings or Settings(db_url=db_url)  # type: ignore[call-arg]
         except Exception as exc:
             if "anthropic_api_key" in str(exc).lower() or "ANTHROPIC_API_KEY" in str(exc):
                 raise ConfigError(
@@ -64,7 +66,9 @@ class DataAnalyst:
 
         W2 implements this. W1 raises NotImplementedError to make the gap explicit.
         """
-        raise NotImplementedError("DataAnalyst.ask() is implemented in W2 (Task: Tool layer + Agent loop).")
+        raise NotImplementedError(
+            "DataAnalyst.ask() is implemented in W2 (Task: Tool layer + Agent loop)."
+        )
 
     def ask_sync(self, question: str) -> Answer:
         """Sync alias for non-async callers (scripts / REPL / notebooks)."""
@@ -89,5 +93,10 @@ class DataAnalyst:
     async def __aenter__(self) -> DataAnalyst:
         return self
 
-    async def __aexit__(self, exc_type, exc, tb) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: object | None,
+    ) -> None:
         await self.close()
