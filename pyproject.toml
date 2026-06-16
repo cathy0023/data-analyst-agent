@@ -8,7 +8,7 @@ version = "0.0.1"
 description = "Python SDK for embedding conversational data analysis (NL → SQL → result → conclusion) into applications"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "TBD" }
+license = { text = "MIT" }
 authors = [{ name = "data-analyst-agent contributors" }]
 keywords = ["nl2sql", "agent", "data-analysis", "llm", "sdk"]
 classifiers = [
@@ -21,14 +21,27 @@ classifiers = [
     "Topic :: Database",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = []
+dependencies = [
+    "anthropic==0.50.*",
+    "sqlalchemy>=2.0,<3.0",
+    "psycopg[binary,pool]>=3.2,<4.0",
+    "sqlglot>=25.0,<26.0",
+    "pydantic>=2.7,<3.0",
+    "pydantic-settings>=2.3,<3.0",
+    "python-dotenv>=1.0,<2.0",
+    "python-json-logger>=2.0,<3.0",
+]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=4.0",
+    "pytest-asyncio>=0.23",
     "mypy>=1.10",
     "ruff>=0.5",
+    "respx>=0.21",
+    "freezegun>=1.5",
+    "pytest-postgresql>=5.0",
 ]
 
 [project.urls]
@@ -44,6 +57,10 @@ include = ["src/", "tests/", "README.md", "pyproject.toml"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
+asyncio_mode = "auto"
+markers = [
+    "live: marks tests that call real Anthropic API (deselect with '-m \"not live\"')",
+]
 
 [tool.mypy]
 python_version = "3.10"
