@@ -2,14 +2,18 @@
 rfc_id: DATA-001
 title: "DATA-001: Conversational Data Analysis Agent SDK (Prototype, 6-week)"
 created: 2026-06-15
-status: Draft v2
+status: Draft v3
 series: DATA
 author: data-analyst-agent contributors
 reviewers: []
 related_inbox: inbox/2026-06-15-data-analyst-agent.md
 revision_history:
   - v1: 2026-06-15 initial draft
-  - v2: 2026-06-15 rewrite after Stage 4 review (3 reviewers, scores 5-6.5/10); applied 4 scope decisions + 11 Critical + 17 High/Medium fixes
+  - v2: 2026-06-15 rewrite after Stage 4 Round 1 (scores 5-6.5/10); applied 4 scope decisions + 11 Critical + 17 High/Medium fixes
+  - v3: 2026-06-16 rewrite after Stage 4 Round 2 (scores 6.0/7.5/8.0, all BLOCK); fixed 7 new Critical:
+      explain_plan sandbox path, workload math (single-developer framing), W6 overload reschedule,
+      W3 false-positive gate redesign, get_schema contradiction removal, Settings field completeness,
+      ask_sync running-loop guard + DataAnalyst thread-safety contract
 ---
 
 # DATA-001: Conversational Data Analysis Agent SDK (Prototype, 6-week)
@@ -88,10 +92,12 @@ The SDK is structured around explicit layers, each independently testable, with 
 └─────────────────────────────┬────────────────────────────────┘
                               │ invokes
 ┌─────────────────────────────▼────────────────────────────────┐
-│  Tool Layer  (tools/{list_tables,get_schema,execute_sql,explain_plan}.py)  │
+│  Tool Layer  (tools/{list_tables,execute_sql,explain_plan}.py)  │
 │  - each tool: Pydantic input/output schema                     │
-│  - tool returns "columns + types + comments + sample values"   │
-│    (not raw DDL) for schema-related tools                      │
+│  - full schema (table + columns + types + comments) is in the  │
+│    system prompt (Tier 1); no on-demand get_schema tool in v1  │
+│    (see Decision #13 — removed in v3 to resolve Tier 2         │
+│    contradiction flagged in Round 2 review)                    │
 └─────────────────────────────┬────────────────────────────────┘
                               │ delegates SQL to
 ┌─────────────────────────────▼────────────────────────────────┐
@@ -119,16 +125,53 @@ __all__ = ["DataAnalyst", "Answer", "AskError", "TokenUsage"]
 ```python
 # Primary class
 class DataAnalyst:
+    """Embeddable NL2SQL agent.
+
+    Thread-safety contract (v3, added per Round-2 review):
+      * Single DataAnalyst instance is safe to share across asyncio tasks running
+        in the SAME event loop. Internal state is immutable after __init__.
+      * Cross-thread sharing is NOT supported — the psycopg AsyncConnectionPool
+        is bound to the event loop that created it. Each OS thread that needs to
+        call ask() must construct its own DataAnalyst (cheap; pool is lazy).
+      * Fork-safety: NOT fork-safe. Forked children must call close() in the
+        parent and re-construct in the child (psycopg pool caveat).
+      * Multiprocessing: each worker process constructs its own instance.
+
+    Lifecycle:
+      * Construct once per process (or once per thread).
+      * Use `async with DataAnalyst(...) as agent:` for auto-cleanup, or call
+        `await agent.close()` explicitly. close() is idempotent.
+    """
+
     def __init__(self, *, db_url: str, settings: Settings | None = None) -> None: ...
 
     async def ask(self, question: str, *, conversation_id: str | None = None) -> Answer: ...
 
     def ask_sync(self, question: str) -> Answer:
-        """Sync alias for non-async callers. Wraps asyncio.run(self.ask(...))."""
+        """Sync alias for non-async callers (scripts / REPL / notebooks).
+
+        Implementation:
+            try:
+                asyncio.get_running_loop()  # detect existing loop
+            except RuntimeError:
+                return asyncio.run(self.ask(question))
+            raise RuntimeError(
+                "ask_sync() cannot run inside a running event loop "
+                "(e.g. inside FastAPI handler, Jupyter cell with asyncio, "
+                "or nested asyncio.run). Use 'await agent.ask(question)' instead."
+            )
+
+        Rationale (v3, per Round-2 review): the prior implementation used
+        asyncio.run() unconditionally, which raises RuntimeError("asyncio.run()
+        cannot be called from a running event loop") when the host app already
+        has a loop. We turn that implicit crash into an explicit, actionable
+        error pointing at the correct API (ask()), rather than silently
+        attempting nest_asyncio hacks that hide wiring bugs.
+        """
         ...
 
     async def close(self) -> None:
-        """Release the connection pool. Idempotent."""
+        """Release the connection pool. Idempotent; safe to call multiple times."""
         ...
 ```
 
@@ -167,7 +210,7 @@ class AskError(BaseModel):
 - Primary API is `async def ask(...)`. Host applications using FastAPI / asyncio can `await agent.ask(q)`.
 - `def ask_sync(...)` provides a sync alias that wraps `asyncio.run(self.ask(...))` — convenience for scripts / REPL.
 - **No streaming in prototype** (Non-Goal): `ask()` returns a single `Answer` after the full agent loop terminates. Latency is bounded by `max_iter * per_iteration_timeout`.
-- `PostgresBackend` owns a single `psycopg_pool.AsyncConnectionPool`. Default `min_size=1, max_size=5`. Pool is created lazily in `DataAnalyst.__init__` and released via `await agent.close()` or context manager `__aexit__`.
+- `PostgresBackend` owns a single `psycopg_pool.AsyncConnectionPool`. Defaults: `min_size=Settings.min_pool_size=1, max_size=Settings.max_pool_size=5`. Pool is created lazily in `DataAnalyst.__init__` and released via `await agent.close()` or context manager `__aexit__`.
 - **Multi-turn conversation is a Non-Goal** (see Non-Goals) — `conversation_id` parameter is reserved in the API for forward compatibility but ignored in v1.
 
 ### Configuration
@@ -180,22 +223,35 @@ class Settings(BaseSettings):
 
     # LLM
     default_model: str = "claude-sonnet-4-6"  # only this in v1; multi-model deferred
-    max_iterations: int = 8
-    llm_timeout_seconds: float = 60.0
+    max_iterations: int = 8                   # circuit breaker for tool-use loop
+    llm_timeout_seconds: float = 60.0         # per Anthropic API call
+    max_retries: int = 2                      # LLM 5xx/429 retry count (exponential backoff)
 
     # Sandbox / Executor
     statement_timeout_seconds: float = 10.0   # enforced via DSN options=-c statement_timeout=Xs
     row_limit: int = 1000                     # injected into SELECT if absent
     cache_ttl_seconds: int = 300              # SQL-hash cache
 
+    # Connection pool (psycopg AsyncConnectionPool)
+    min_pool_size: int = 1
+    max_pool_size: int = 5
+
     # Redaction (default-on, see Security)
     enable_redaction: bool = True
+
+    # Business glossary
+    glossary_path: Path | None = None         # default: package-bundled glossary.yaml; override for host apps
 
     # Logging
     log_level: str = "INFO"
 
+    # OpenTelemetry (reserved, not implemented in prototype)
+    otel_endpoint: str | None = None          # e.g. "http://localhost:4317"; None = disabled
+
     model_config = SettingsConfigDict(env_prefix="DATA_AGENT_", env_file=".env", extra="forbid")
 ```
+
+**Single source of truth (v3, added per Round-2 review)**: every magic number in the SDK lives in `Settings`. Module-level constants for tunables are **forbidden** — code paths read `self._settings.xxx`, never hardcode `8` or `10.0`. This eliminates the v2 drift where `max_iterations=8` appeared in 3 places (Settings, agent.py loop guard, error message) and `statement_timeout_seconds=10.0` appeared in 2 (Settings, sandbox injection).
 
 **Failure modes**:
 
@@ -218,15 +274,17 @@ class Settings(BaseSettings):
 
 #### Tool-use error feedback protocol
 
-When `execute_sql` rejects SQL (sandbox or DB error), the Agent must observe a structured `tool_use_error` block (Anthropic format) containing:
+When `execute_sql` rejects SQL (sandbox or DB error), the Agent must observe a structured `tool_use_error` block (Anthropic format). Messages are **English-first** (machine-readable, maximizes LLM self-correction success — Claude is primarily trained on English error formats) with a Chinese hint appended for human log readability:
 
 ```json
 {
   "kind": "sandbox_rejection",
-  "message": "SQL 包含禁止的语句: DELETE。仅允许 SELECT / WITH ... SELECT。",
-  "hint": "请改写为只读查询；如需删除数据，请联系 DBA。"
+  "message": "SQL rejected: statement 'DELETE' is not allowed. Only SELECT / WITH ... SELECT are accepted. (SQL 包含禁止语句 DELETE；仅允许只读查询)",
+  "hint": "Rewrite as read-only SELECT; for write operations contact your DBA. (请改写为只读查询)"
 }
 ```
+
+Rationale (v3, per Round-2 review): Round 2 flagged that pure-Chinese error messages may degrade LLM self-correction rate because Sonnet 4.6's training distribution skews English. v3 keeps Chinese for human-readable `Answer.error.message` (user-facing) but uses English-first for in-loop `tool_use_error` (LLM-facing). The bilingual format lets Chinese developers read the log without translation tools.
 
 This allows the LLM to self-correct within the loop. If 2 consecutive `sandbox_rejection` occur for the same question, the Agent terminates with `max_iterations_exceeded` (circuit breaker).
 
@@ -234,12 +292,14 @@ This allows the LLM to self-correct within the loop. If 2 consecutive `sandbox_r
 
 | DB size | Strategy | Token cost (demo-proven estimate) |
 |---------|----------|-----------------------------------|
-| ≤30 tables | Full schema in system prompt | ~1–4k tokens (10 tables × ~60 cols × ~6 tokens/col ≈ 3.6k) |
-| 30–200 tables | `get_schema(tables: list[str])` on-demand tool, cached | ~300–500 tokens per call |
+| ≤30 tables | Full schema (tables + columns + types + comments) in system prompt | ~1–4k tokens (10 tables × ~60 cols × ~6 tokens/col ≈ 3.6k) |
+| 30–200 tables | On-demand `get_schema(tables)` tool, cached | ~300–500 tokens per call |
 
 For the prototype we implement **tier 1 only** (full schema injection). **Tier 2 (on-demand tool) is deferred to post-prototype** because the 10-table demo set cannot exercise it (always falls into tier 1). This resolves the Stage-4 review finding "Tier 2 unverifiable in demo".
 
-Token cost numbers above are based on a **measured estimate** against the demo schema (10 tables, ~60 columns total, with comments and sample values); they will be re-measured in W1 and reported in the metrics report.
+**v3 clarification (per Round-2 review)**: this means **no `get_schema` tool in v1 at all**. The tool list in v1 is `list_tables`, `execute_sql`, `explain_plan` (3 tools, not 4). The Round-2 reviewer flagged that v2's Module Layout had `get_schema.py` + AC-7 required it, contradicting "Tier 2 deferred". v3 removes it cleanly: with full schema in the system prompt, the LLM does not need a per-table drill-down tool. If a future schema grows past tier 1, `get_schema` is reintroduced in a follow-up RFC alongside the tier-2 retrieval strategy.
+
+Token cost numbers above are based on a **measured estimate** against the demo schema (10 tables, ~60 columns total, with comments); they will be re-measured in W1 and reported in the metrics report.
 
 ### Business Glossary
 
@@ -302,10 +362,23 @@ After Stage-4 review flagged deny-list as insufficient, the sandbox is now **all
 1. **Allow-list (primary defense)**: `sqlglot.parse_one(sql, dialect="postgres")` must yield a root node of type `exp.Select` or `exp.With` (containing only SELECT in body). Anything else → reject.
 2. **Deny-list (defense-in-depth)**: even within allowed shape, explicitly reject if AST contains any of: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `DROP`, `ALTER`, `TRUNCATE`, `GRANT`, `REVOKE`, `COPY`, `CALL`, `LISTEN`, `NOTIFY`, `DO` (anonymous PL/pgSQL blocks), `COMMENT ON`, `SET` (other than sandbox-injected `SET LOCAL`).
 3. **Subquery traversal**: walk the full AST (including CTEs and subqueries); deny any non-SELECT node anywhere.
-4. **`statement_timeout` enforcement**: **at DSN level**, not via SQL `SET LOCAL`. The connection string includes `options='-c statement_timeout=10000'` (configurable). SQL-side `SET LOCAL statement_timeout` is no longer trusted (an LLM can write `RESET statement_timeout` to bypass it).
+4. **`statement_timeout` enforcement**: **at DSN level**, not via SQL `SET LOCAL`. The connection string includes `options='-c statement_timeout=10000'` (configurable via `Settings.statement_timeout_seconds`). SQL-side `SET LOCAL statement_timeout` is no longer trusted (an LLM can write `RESET statement_timeout` to bypass it).
 5. **`LIMIT` injection**: if a SELECT has no `LIMIT` clause, append `LIMIT <row_limit>`; if it has `LIMIT > row_limit`, truncate to `row_limit`.
 6. **Read-only DB user**: SDK connects with a DB user that has `SELECT`-only grants; documented in README setup. Enforced via `SET ROLE` check at init (probe query).
 7. **Fail-closed**: if `sqlglot.parse_one` raises (unparseable SQL), log + reject; never execute.
+
+#### `explain_plan` sandbox path (v3, resolves Round-2 NC-1)
+
+Round-2 architecture review flagged that `EXPLAIN <stmt>` is a separate PG statement type — `sqlglot.parse_one("EXPLAIN SELECT ...")` returns `exp.Explain` as root, which the allow-list rejects. v3 specifies the exact path:
+
+1. The `explain_plan` tool takes raw SQL as input (same shape as `execute_sql`).
+2. **The tool never sends `EXPLAIN` syntax to sqlglot.** Instead, the LLM-supplied SQL is validated **as if it were a SELECT** using the same `sandbox.validate(sql)` function (allow-list + deny-list + subquery walk + LIMIT injection).
+3. If validation passes, the tool wraps the validated SELECT body with `EXPLAIN (ANALYZE, BUFFERS) ` and sends the wrapped string to `PostgresBackend.explain()` (a separate method from `execute()`).
+4. The `EXPLAIN` wrapper itself is added **by trusted SDK code**, not by the LLM — so the LLM cannot smuggle disallowed statement types inside an EXPLAIN context.
+5. `EXPLAIN ANALYZE` executes the underlying query, so `statement_timeout` (DSN-level) still applies. Read-only DB user still applies (no writes happen).
+6. Test coverage: `tests/unit/test_sandbox.py::test_explain_plan_rejects_non_select` confirms that `explain_plan("DELETE FROM users")` is rejected at step 2 (the DELETE is parsed standalone, denied by allow-list) before any EXPLAIN wrapping happens.
+
+This pattern — "validate the inner statement, then SDK wraps with a trusted prefix" — is the same approach used for `LIMIT` injection (rule 5) and `statement_timeout` (rule 4): never trust the LLM to write the safety-critical syntactic wrapper.
 
 #### Result redaction (default-on)
 
@@ -351,25 +424,24 @@ Redaction runs in the Executor layer, **after** SQL execution **before** rows ar
 ```
 src/data_analyst_agent/
 ├── __init__.py              # Public API exports
-├── agent.py                 # Agent layer: async tool use loop, sync alias, guards
-├── config.py                # Settings (pydantic-settings), env binding
+├── agent.py                 # Agent layer: async tool use loop, sync alias (with loop-detection), guards
+├── config.py                # Settings (pydantic-settings), env binding — single source of truth for all tunables
 ├── models.py                # Answer, AskError, TokenUsage, ResultSet, etc.
 ├── logging_setup.py         # Structured logging config
 ├── llm/                     # LLM client
 │   ├── __init__.py
 │   ├── base.py              # LLMClient Protocol (Python Protocol, not ABC)
 │   └── anthropic_client.py  # AnthropicClient(concrete) + retry/backoff
-├── tools/                   # Tool layer
+├── tools/                   # Tool layer (3 tools in v1; get_schema removed in v3)
 │   ├── __init__.py
 │   ├── base.py              # Tool Protocol + registry
 │   ├── list_tables.py
-│   ├── get_schema.py
 │   ├── execute_sql.py
-│   └── explain_plan.py
+│   └── explain_plan.py      # wraps validated SELECT in EXPLAIN; see §Sandbox
 └── executor/                # Executor layer
     ├── __init__.py
-    ├── postgres.py          # PostgresBackend (CONCRETE class, no ABC)
-    ├── sandbox.py           # sqlglot allow-list + deny-list + LIMIT injection
+    ├── postgres.py          # PostgresBackend (CONCRETE class, no ABC); methods: connect / execute / explain / list_tables / get_table_schema / close
+    ├── sandbox.py           # sqlglot allow-list + deny-list + LIMIT injection; shared by execute_sql and explain_plan
     ├── redaction.py         # Default regex rules + apply() function
     └── cache.py             # SQL-hash cache with TTL
 ```
@@ -413,14 +485,15 @@ dev = [
 
 | Layer | Test type | Strategy |
 |-------|-----------|----------|
-| Sandbox | Unit (no DB) | sqlglot AST tests: allow-list acceptance, deny-list rejection (16+ banned constructs), subquery traversal, LIMIT injection |
+| Sandbox | Unit (no DB) | sqlglot AST tests: allow-list acceptance, deny-list rejection (16+ banned constructs), subquery traversal, LIMIT injection, **explain_plan inner-statement validation** (v3: rejects `DELETE` inside `explain_plan` before EXPLAIN wrapping) |
 | PostgresBackend | Integration (real PG via `pytest-postgresql`) | `conftest.py` seeds from `tests/fixtures/demo_db.sql` |
-| Tools | Unit | Mock `PostgresBackend`; assert Pydantic input/output contract |
+| Tools | Unit | Mock `PostgresBackend`; assert Pydantic input/output contract for 3 tools (`list_tables`, `execute_sql`, `explain_plan`) |
 | LLMClient | Unit + integration | `respx` mock for canned tool_use responses; integration smoke test against real Anthropic API (marked `@pytest.mark.live`, skipped in CI default) |
 | Agent loop | Integration | Mock `LLMClient` returning canned tool_use sequences; verify termination, retry, circuit breaker |
-| **Failure injection** (new) | Integration | Mock LLM returns malformed tool_use / disallowed SQL / network error; verify retry, sandbox rejection feedback, partial Answer on max_iter |
-| End-to-end | Integration | Real PG + mocked LLM (deterministic) on 30 demo questions |
-| Eval (W3) | Statistical | Real PG + real Sonnet 4.6; 30 questions × 3 runs at temp=0; report median accuracy per tier |
+| **Failure injection** | Integration | Mock LLM returns malformed tool_use / disallowed SQL / network error; verify retry, sandbox rejection feedback, partial Answer on max_iter |
+| End-to-end (W3 part a) | Integration | Real PG + mocked LLM on 15 deterministic questions; expect 15/15 (plumbing validation only — **not** an accuracy signal) |
+| **Real-LLM baseline (W3 part b)** (v3) | Integration | Real PG + real Sonnet 4.6 on 5 representative questions × 1 run at temp=0; gate ≥ 60% — catches structural prompt issues before W4 |
+| Eval (W4) | Statistical | Real PG + real Sonnet 4.6; 30 questions × 3 runs at temp=0; report median accuracy per tier |
 
 ### Demo Dataset & Question Set
 
@@ -443,18 +516,33 @@ Result-row-set comparison rules (resolves Stage-4 H-1):
 
 These rules are encoded in `scripts/eval_normalizer.py` with its own unit tests (AC-9).
 
-### Milestones (6-week)
+### Milestones (6-week, single-developer prototype)
 
-Time-box extended from 4 to 6 weeks after Stage-4 review (Reviewer 2 estimated 27-50 person-days; 3 × 6 × 5 = 90 person-hours ≈ 11 person-days at 100% focus, padded to 18 person-days with realistic utilization — fits the lower bound).
+**Capacity math (v3, corrected per Round-2 NEW-C-1)**: this is a **single-developer prototype**. Capacity = 1 developer × 6 weeks × 5 working days/week = **30 person-days**. The v2 text "3 × 6 × 5 = 90 person-hours" was a units error (should have been 90 person-DAYS for a 3-person team; or 30 person-days for solo). v3 reframes honestly as solo:
+
+- Task estimate (sum of W1-W6 deliverables below): **25-28 person-days** at expected velocity.
+- Utilization: 83-93%, leaving **2-5 person-days buffer** for accuracy tuning iterations (W4) and demo polish (W6).
+- If the developer has < 25 person-days available, **the scope must shrink** — see Risk Register R8 mitigation (escalate at W4 gate, not W6).
+
+The 3-person team framing in the brainstorm was project-shape language, not staffing commitment. Treating this as solo also forces scope honesty: every W2 tool and every W3 fixture is a concrete cost, not "someone else will do it".
 
 | Week | Deliverable | Gate criteria |
 |------|-------------|---------------|
-| W1 | `pyproject.toml` synced; `Settings` + `DataAnalyst.__init__` + `PostgresBackend` (concrete) + sandbox (allow-list) + redaction defaults | AC-1, AC-2, AC-17 pass; sandbox rejects 16+ banned constructs; `statement_timeout` works via DSN on real PG |
-| W2 | 4 tools (`list_tables`, `get_schema`, `execute_sql`, `explain_plan`) with Pydantic schemas; `LLMClient` Protocol + `AnthropicClient`; Agent loop with `max_iter=8` + circuit breaker; failure injection tests | AC-6, AC-7, AC-8, AC-16 pass; mock LLM tests green; `pytest --asyncio-mode=auto` clean |
-| W3 | Demo dataset (`demo_db.sql` 10 tables + 10k rows); 30-question set `questions.yaml` with expected shapes; `eval.py` + `eval_normalizer.py` (with unit tests); **smoke run with mock LLM** to validate pipeline | AC-9 pass with mock LLM (sanity: 30/30 deterministic); `accuracy_report.json` schema fixed |
-| W4 | First real-LLM eval run on 30 questions × 3 runs; per-tier accuracy baseline; prompt / glossary iteration | AC-10 reached OR plan-B triggered (see Risk Register); failure-mode analysis drafted |
-| W5 | Latency optimization (warm pool, cache hit ratio); metrics report (`docs/metrics-report.md`) draft | AC-11 split into cold/warm; metrics report has all 5 required sections |
-| W6 | SDK packaging; `examples/demo.py` + `make demo` scripted; README + 5-minute-clone test; final metrics report | AC-12, AC-13, AC-14(new: scripted demo), AC-15, AC-18 pass |
+| W1 | `pyproject.toml` synced (AC-18); `Settings` + `DataAnalyst.__init__` + `PostgresBackend` (concrete) + sandbox (allow-list, 16+ banned constructs) + redaction defaults (AC-19) + concurrency scaffolding | AC-1, AC-2, AC-17, AC-18, AC-19 pass; sandbox rejects 16+ banned constructs; `statement_timeout` works via DSN on real PG |
+| W2 | **3 tools** (`list_tables`, `execute_sql`, `explain_plan`) with Pydantic schemas; `LLMClient` Protocol + `AnthropicClient`; Agent loop with `max_iter=8` + circuit breaker; failure injection tests | AC-6, AC-7 (3 tools, not 4), AC-8, AC-16 pass; mock LLM tests green; `pytest --asyncio-mode=auto` clean |
+| W3 | Demo dataset (`demo_db.sql` 10 tables + 10k rows); 30-question set `questions.yaml` with expected shapes; `eval.py` + `eval_normalizer.py` (with unit tests). **Two-part gate** (replaces v2 false-positive smoke run, per Round-2 NEW-C-3):<br>(a) Mock-LLM pipeline validation: 15 deterministic questions, expect 15/15 (validates plumbing only)<br>(b) Real-LLM accuracy baseline: 5 representative questions × 1 run at temp=0; gate = **≥ 60% accuracy** (NOT 80%) | AC-9 pass with mock LLM (15/15 deterministic); real-LLM baseline ≥ 60% on 5-question sample; if baseline < 60%, **STOP and iterate on prompt + glossary before W4** — do not proceed hoping W4 tuning fixes structural prompt issues |
+| W4 | First full real-LLM eval run on 30 questions × 3 runs; per-tier accuracy baseline; prompt / glossary iteration; failure-mode analysis drafted | AC-10 reached (≥ 80% overall, ≥ 90% easy, ≥ 60% hard) OR plan-B triggered (see Risk Register R4); if accuracy > 10pp below any threshold at end of W4, **escalate to user before W5** (do not silently push to W6) |
+| W5 | Latency optimization (warm pool, cache hit ratio); **concurrency hardening** (AC-20 — 5 parallel `ask()` calls share pool without deadlock); metrics report (`docs/metrics-report.md`) **first complete draft** (all 5 sections, content roughly final); `examples/demo.py` skeleton (AC-15 lint scope creeps in here, not W6) | AC-11 (cold/warm latency split) pass; AC-20 (concurrency) pass; AC-13 metrics report has all 5 H2 sections, each ≥ 100 words (draft quality); AC-15 mypy + ruff clean |
+| W6 | **Reduced load (per Round-2 NEW-C-2)**: SDK packaging + PyPI publish dry-run; `make demo` scripted 5-minute clone; README + quickstart; final metrics report polish (incorporate W5 review feedback); bug-fix buffer (2-3 person-days reserved) | AC-12 (scripted 5-min clone) pass; AC-13 final; AC-14 N/A (slot retired); AC-15 holds; bug buffer unused = stretch goal (e.g., add 5 more demo questions, improve glossary coverage) |
+
+**v3 changes from v2** (all per Round-2 review):
+1. Removed AC-14 from W6 (was "(removed in v2 — slot reserved for future use)" — Round-2 flagged this as dead weight; v3 retires the slot entirely).
+2. Moved AC-18 (pyproject sync) from W6 → W1 (it's the W1 task-0 gate anyway).
+3. Moved AC-19 (redaction) explicit into W1 (was implicit; now has a home).
+4. Moved AC-20 (concurrency) into W5 (was orphaned in v2).
+5. Moved metrics report drafting from W6 → W5 (W6 only polishes).
+6. Replaced W3 mock-only smoke (false-positive safety) with two-part gate including real-LLM baseline.
+7. Reserved W6 bug-fix buffer (v2 had none).
 
 ## Acceptance Criteria
 
@@ -463,17 +551,17 @@ Time-box extended from 4 to 6 weeks after Stage-4 review (Reviewer 2 estimated 2
 | AC-1 | `pip install -e ".[dev]"` succeeds on Python 3.10+ in a clean venv | Fresh venv install exits 0 |
 | AC-2 | `from data_analyst_agent import DataAnalyst, Answer, AskError, TokenUsage` resolves | `python -c "..."` exits 0 |
 | AC-3 | `Answer` Pydantic schema has all fields per Public API Contract; round-trip serialization works | `tests/unit/test_models.py::test_answer_round_trip` passes |
-| AC-4 | Sandbox rejects **all of**: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `DROP`, `ALTER`, `TRUNCATE`, `GRANT`, `REVOKE`, `COPY`, `CALL`, `LISTEN`, `NOTIFY`, `DO` (anonymous block), `COMMENT ON`, `SET` (non-sandbox) — 16 banned constructs | `tests/unit/test_sandbox.py` ≥16 rejection test cases all pass |
+| AC-4 | Sandbox rejects **all of**: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `DROP`, `ALTER`, `TRUNCATE`, `GRANT`, `REVOKE`, `COPY`, `CALL`, `LISTEN`, `NOTIFY`, `DO` (anonymous block), `COMMENT ON`, `SET` (non-sandbox) — 16 banned constructs. **Additionally (v3, per Round-2 NC-1)**: `explain_plan("DELETE FROM users")` is rejected before any EXPLAIN wrapping — confirms the tool validates the inner statement, not the wrapped syntax. | `tests/unit/test_sandbox.py` ≥16 rejection test cases + `test_explain_plan_rejects_non_select` all pass |
 | AC-5 | Sandbox enforces `LIMIT` and `statement_timeout`; **pg_sleep(60) is killed at 10s via DSN-level timeout** (not SQL-side `SET LOCAL`) | `tests/integration/test_postgres_backend.py::test_statement_timeout_kills_pg_sleep` < 15s wall clock |
-| AC-6 | `PostgresBackend` concrete class implements `connect / execute / list_tables / get_table_schema / explain / close`; all methods have type signatures per Public API Contract | `tests/integration/test_postgres_backend.py` covers each method |
-| AC-7 | Tool layer has `list_tables`, `get_schema`, `execute_sql`, `explain_plan`; each has Pydantic input/output schema validated | `tests/unit/test_tools.py` covers each tool's contract |
+| AC-6 | `PostgresBackend` concrete class implements `connect / execute / explain / list_tables / get_table_schema / close`; all methods have type signatures per Public API Contract | `tests/integration/test_postgres_backend.py` covers each method |
+| AC-7 | Tool layer has **3 tools**: `list_tables`, `execute_sql`, `explain_plan`; each has Pydantic input/output schema validated. (`get_schema` removed in v3 — see Decision #13.) | `tests/unit/test_tools.py` covers each tool's contract |
 | AC-8 | Agent loop terminates within `max_iter=8` even on adversarial input (mock LLM returning tool_use forever); on terminate, returns `Answer(error=AskError(kind="max_iterations_exceeded"), ...)` | Property-based test with mock LLM |
 | AC-9 | `scripts/eval.py` produces `accuracy_report.json` with 30 entries (one per question) × 3 runs, plus per-tier aggregates + cold/warm latency split + token cost; `eval_normalizer.py` has its own unit tests | `accuracy_report.json` schema validated; normalizer unit tests green |
 | AC-10 | **Median accuracy across 3 runs at temperature=0 ≥80% overall AND ≥90% on easy tier AND ≥60% on hard tier**; per-question pass/fail + actual SQL saved for post-hoc analysis | `accuracy_report.json` `"overall_accuracy_median" >= 0.80` AND `"easy_accuracy_median" >= 0.90` AND `"hard_accuracy_median" >= 0.60` |
 | AC-11 | P95 latency on demo set (single-threaded, Sonnet 4.6) ≤ **20s warm** (after 3 warm-up calls) and ≤ 45s cold (first call); reported separately, no single threshold | `accuracy_report.json` `"p95_warm_ms" <= 20000` AND `"p95_cold_ms" <= 45000` |
 | AC-12 | **Scripted 5-minute clone-to-run**: `make demo` (single command, idempotent, runs `docker compose up -d postgres` + `pip install -e .` + seed + `python examples/demo.py`); measured ≤5 min on macOS arm64 + Linux x86_64 | CI job `e2e-clone-to-run.yml` runs `make demo` on a clean container, asserts `Answer.summary` is non-empty |
 | AC-13 | Metrics report (`docs/metrics-report.md`) has 5 sections: (1) overall + per-tier accuracy, (2) P50/P95 latency cold/warm, (3) token cost per tier + total, (4) top-5 failure modes with examples, (5) plan-B / scope-change log if triggered | File exists with 5 H2 sections, each non-empty |
-| AC-14 | (Removed in v2 — multi-model router deferred. Slot reserved for future use.) | N/A |
+| AC-14 | **(Slot retired in v3)** — v2 had this as "removed in v2, slot reserved for future use"; Round-2 review flagged dead-weight slot. v3 drops the AC number entirely from the milestone gates. | N/A |
 | AC-15 | `mypy --strict src/` clean (0 errors); `ruff check src/ tests/` clean (0 errors) | `make lint` exits 0; mypy `ignore_missing_imports` allowed in `tests/` only |
 | AC-16 | **Failure injection tests pass**: 5 scenarios (malformed tool_use, disallowed SQL → self-correct, persistent sandbox rejection → circuit break, LLM 5xx → retry, max_iter no converge → partial Answer) | `tests/integration/test_failure_injection.py` 5/5 green |
 | AC-17 | Missing `ANTHROPIC_API_KEY` env var at `DataAnalyst.__init__` raises `ConfigError` with Chinese actionable message; missing/invalid `db_url` similarly fails fast with `psycopg` details | `tests/unit/test_config.py::test_missing_api_key` + `test_bad_db_url` |
@@ -496,7 +584,21 @@ Time-box extended from 4 to 6 weeks after Stage-4 review (Reviewer 2 estimated 2
 9. **Native Anthropic tool use (no framework)** — Stage 1 research + Stage-4 review consensus: `while stop_reason == "tool_use"` loop is ~100 LOC, max debuggability, no framework overhead. `instructor` considered and rejected (single-shot structuring, weak at multi-tool loop); `pydantic-ai` considered and deferred (Pydantic type safety is nice-to-have, not need-to-have for prototype).
 10. **Sandbox is allow-list** (v2 change) — Stage-4 review flagged v1 deny-list as insufficient (`COPY`, `DO`, pl/pgSQL blocks, `MERGE` not covered). Allow-list = root AST must be `Select` or `With`. `statement_timeout` moved from SQL `SET LOCAL` (bypassable) to DSN options (not bypassable). Resolves v1's sandbox holes.
 11. **Redaction default-on** (v2 change) — Stage-4 review flagged v1's "opt-in" as wrong default for a SDK consuming potentially sensitive rows. Now on by default with 4 rules; opt-out via Settings.
-12. **Chinese-first i18n** (v2 change) — Project name `data-analyst-agent` + Chinese-speaking user base → all demo questions, system prompt, error messages, glossary in Chinese. English deferred.
+12. **Chinese-first i18n** (v2 change) — Project name `data-analyst-agent` + Chinese-speaking user base → all demo questions, system prompt, error messages, glossary in Chinese. English deferred. (v3 refinement: in-loop `tool_use_error` is English-first with Chinese hint appended — LLM-facing surfaces stay English-dominant to preserve self-correction rate; human-facing surfaces stay Chinese.)
+
+13. **Remove `get_schema` from v1** (v3 change) — Round-2 review flagged the contradiction: v2 said "Tier 2 schema injection deferred" but Module Layout had `get_schema.py` + AC-7 required 4 tools. v3 removes `get_schema` cleanly: with full schema in system prompt (tier 1), the LLM has no need to drill down per-table. If a future schema exceeds tier 1, the tool is reintroduced in a follow-up RFC alongside the tier-2 retrieval strategy. **Tool count: 4 → 3** (`list_tables`, `execute_sql`, `explain_plan`).
+
+14. **`explain_plan` validates inner statement, SDK wraps with EXPLAIN** (v3 change) — Round-2 architecture review (NC-1) flagged that `EXPLAIN <stmt>` is a separate PG statement type which the allow-list would reject. v3 specifies the path: the tool takes raw SQL, validates it via the same `sandbox.validate()` used by `execute_sql`, then SDK code wraps with `EXPLAIN (ANALYZE, BUFFERS) `. The LLM never writes the EXPLAIN prefix; trusted SDK code does. This matches the pattern used for `LIMIT` injection and `statement_timeout` enforcement (rule: never trust the LLM to write safety-critical syntactic wrappers).
+
+15. **Single-developer prototype framing** (v3 change) — Round-2 feasibility review (NEW-C-1) caught a units error in v2's workload math (`3 × 6 × 5 = 90 person-hours` should be `90 person-days` for 3-person, or `30 person-days` for solo). v3 reframes honestly as **solo developer, 30 person-days capacity, 25-28 person-days task estimate, 2-5 person-days buffer**. This forces scope honesty: every W2 tool and W3 fixture is concrete solo cost, not "someone else's job". If buffer is exhausted at W4 gate, escalate (R8).
+
+16. **`ask_sync` running-loop guard** (v3 change) — Round-2 content review flagged that `asyncio.run(self.ask(...))` raises `RuntimeError` when called from a running loop (FastAPI handler, Jupyter, nested asyncio). v3 turns this into an actionable error: detect running loop, raise explicit `RuntimeError` pointing the caller at `await agent.ask(...)` instead. Rejected alternative: `nest_asyncio` hack — hides wiring bugs and is unmaintained.
+
+17. **`DataAnalyst` thread-safety contract** (v3 change) — Round-2 content review flagged undeclared thread safety. v3 documents the contract explicitly: **same-event-loop tasks** may share one instance (state is post-`__init__` immutable); **cross-thread sharing is unsupported** (psycopg `AsyncConnectionPool` is loop-bound); **fork/multiprocessing is unsupported** (each child constructs its own instance). This matches `httpx.AsyncClient` and `psycopg.AsyncConnectionPool` upstream contracts.
+
+18. **Settings as single source of truth** (v3 change) — Round-2 content review flagged hardcoded drift (`max_iterations=8` in 3 places, `statement_timeout_seconds=10.0` in 2 places). v3 rule: **every tunable lives in `Settings`; module-level constants for tunables are forbidden**. Added 5 missing fields: `max_retries`, `min_pool_size`, `max_pool_size`, `glossary_path`, `otel_endpoint`.
+
+19. **W3 two-part gate** (v3 change) — Round-2 feasibility review (NEW-C-3) flagged v2's W3 gate ("mock LLM 30/30 deterministic") as false-positive safety — mock only validates pipeline, not accuracy. v3 replaces with two-part gate: (a) mock 15-question plumbing check, (b) real-LLM 5-question baseline ≥ 60%. If baseline < 60%, STOP and fix prompt/glossary before W4 — do not silently push to W4 hoping tuning fixes structural issues.
 
 ### Open Items Deferred to Stage 7 PLAN
 
@@ -515,7 +617,7 @@ Time-box extended from 4 to 6 weeks after Stage-4 review (Reviewer 2 estimated 2
 | R5 | sqlglot mis-parses valid PG SQL (e.g., complex CTE, window functions) | Low | High | Fail-closed by design (reject + log); `tests/fixtures/sql_corpus.sql` carries 50+ PG-specific SQL shapes tested for both acceptance and rejection |
 | R6 | PG version drift between dev / CI / demo | Medium | Medium | CI runs against `postgres:16` only in prototype; README documents PG 14+ requirement; v1 does not matrix-test across PG versions |
 | R7 | `pytest-postgresql` binaries unavailable / slow in CI | Low | Medium | Fallback: `docker compose` based fixture; documented in `conftest.py` |
-| R8 | 6-week time-box overrun despite padding | Medium | Medium | Weekly gate review; if W4 (real-LLM eval) shows accuracy >10pp below threshold, escalate before W5 (do not push to W6 silently) |
+| R8 | 6-week time-box overrun despite buffer | Medium | Medium | **v3 mitigation**: weekly gate review with explicit checkpoints. W3 gate (real-LLM baseline ≥ 60%) catches prompt-structure issues before W4. W4 gate (≥ 80% accuracy) catches tuning issues before W5/W6. If W4 ends > 10pp below any accuracy threshold, escalate to user with three options: (a) extend time-box by 1 week, (b) reduce hard-tier question count from 5 → 3, (c) accept gap and document. **Do not silently push overrun to W6.** Solo-developer framing means there is no "throw more people at it" option. |
 
 **Removed from v1 Risk Register** (Stage-4 M-4): "Worktree tooling flakiness" — this is a dev-environment observation, not a project risk. Moved to Dev Environment Notes below.
 
