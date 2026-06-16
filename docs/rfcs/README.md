@@ -6,7 +6,7 @@ This directory tracks Request for Comments documents for this project.
 
 | Project | Series Prefix | Next Number |
 |---------|---------------|-------------|
-| data-analyst-agent | DATA | 1 |
+| data-analyst-agent | DATA | 2 |
 
 ## Directory Structure
 
@@ -21,8 +21,9 @@ This directory tracks Request for Comments documents for this project.
 
 | ID | Title | Status | File |
 |----|-------|--------|------|
+| DATA-001 | Conversational Data Analysis Agent SDK (Prototype, 6-week) | Approved (2026-06-16) | [approved/DATA-001-data-analyst-agent.md](approved/DATA-001-data-analyst-agent.md) |
 
-> No formal RFCs yet. See `Inbox` section below for raw requirement documents awaiting RFC authoring.
+> DATA-001 passed Stage 4 review (3/3 reviewers ≥8.0) and Stage 5 mgv-rfc-approve (5 dimensions all PASS) on 2026-06-16. Currently in Stage 6 (Extraction) → Stage 7 (Plan) of `/rfc-driven-dev`.
 
 ## Inbox (brainstorm output, not yet RFC)
 

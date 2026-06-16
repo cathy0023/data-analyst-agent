@@ -2,7 +2,8 @@
 rfc_id: DATA-001
 title: "DATA-001: Conversational Data Analysis Agent SDK (Prototype, 6-week)"
 created: 2026-06-15
-status: Draft v3
+status: Approved
+approved: 2026-06-16
 series: DATA
 author: data-analyst-agent contributors
 reviewers: []
@@ -10,10 +11,9 @@ related_inbox: inbox/2026-06-15-data-analyst-agent.md
 revision_history:
   - v1: 2026-06-15 initial draft
   - v2: 2026-06-15 rewrite after Stage 4 Round 1 (scores 5-6.5/10); applied 4 scope decisions + 11 Critical + 17 High/Medium fixes
-  - v3: 2026-06-16 rewrite after Stage 4 Round 2 (scores 6.0/7.5/8.0, all BLOCK); fixed 7 new Critical:
-      explain_plan sandbox path, workload math (single-developer framing), W6 overload reschedule,
-      W3 false-positive gate redesign, get_schema contradiction removal, Settings field completeness,
-      ask_sync running-loop guard + DataAnalyst thread-safety contract
+  - v3: 2026-06-16 rewrite after Stage 4 Round 2 (scores 6.0/7.5/8.0, all BLOCK); fixed 7 new Critical
+  - v3.1: 2026-06-16 Round 3 cleanup (3/3 PASS at 8.0/8.5/8.5); applied C-1 + H-1/H-2/H-2/M-1 fixes
+  - approved: 2026-06-16 Stage 4 PASS (3/3 reviewers ≥8), Stage 5 mgv-rfc-approve 5 维度全部通过
 ---
 
 # DATA-001: Conversational Data Analysis Agent SDK (Prototype, 6-week)
