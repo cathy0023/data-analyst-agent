@@ -171,7 +171,20 @@ class DataAnalyst:
         ...
 
     async def close(self) -> None:
-        """Release the connection pool. Idempotent; safe to call multiple times."""
+        """Release the connection pool. Idempotent; safe to call multiple times.
+
+        Behavior with in-flight ask() (v3, added per Round-2 architecture review):
+          * Per psycopg AsyncConnectionPool semantics, close() waits for
+            checked-out connections to be returned before closing. In-flight
+            queries are NOT cancelled — they run to completion (or until
+            statement_timeout fires).
+          * Callers using `async with DataAnalyst(...) as agent:` should ensure
+            all background `asyncio.create_task(agent.ask(...))` tasks are
+            awaited or cancelled before __aexit__ invokes close(). Otherwise
+            __aexit__ blocks until those queries finish.
+          * For graceful shutdown, call `await asyncio.gather(*pending_tasks)`
+            before `await agent.close()`.
+        """
         ...
 ```
 
@@ -225,7 +238,7 @@ class Settings(BaseSettings):
     default_model: str = "claude-sonnet-4-6"  # only this in v1; multi-model deferred
     max_iterations: int = 8                   # circuit breaker for tool-use loop
     llm_timeout_seconds: float = 60.0         # per Anthropic API call
-    max_retries: int = 2                      # LLM 5xx/429 retry count (exponential backoff)
+    max_retries: int = 3                      # LLM 5xx/429 retry count (matches backoff schedule 1s/2s/4s in §Error Handling)
 
     # Sandbox / Executor
     statement_timeout_seconds: float = 10.0   # enforced via DSN options=-c statement_timeout=Xs
@@ -360,9 +373,13 @@ The Agent reads this file in the system prompt; glossary updates are hot-reloada
 After Stage-4 review flagged deny-list as insufficient, the sandbox is now **allow-list** with explicit deny-layer:
 
 1. **Allow-list (primary defense)**: `sqlglot.parse_one(sql, dialect="postgres")` must yield a root node of type `exp.Select` or `exp.With` (containing only SELECT in body). Anything else → reject.
-2. **Deny-list (defense-in-depth)**: even within allowed shape, explicitly reject if AST contains any of: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `DROP`, `ALTER`, `TRUNCATE`, `GRANT`, `REVOKE`, `COPY`, `CALL`, `LISTEN`, `NOTIFY`, `DO` (anonymous PL/pgSQL blocks), `COMMENT ON`, `SET` (other than sandbox-injected `SET LOCAL`).
+2. **Deny-list (defense-in-depth)**: even within allowed shape, explicitly reject if AST contains any of: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `DROP`, `ALTER`, `TRUNCATE`, `GRANT`, `REVOKE`, `COPY`, `CALL`, `LISTEN`, `NOTIFY`, `DO` (anonymous PL/pgSQL blocks), `COMMENT ON`, `SET` (all forms, including `SET LOCAL` — v3 change: removed the v2 "(other than sandbox-injected SET LOCAL)" carve-out since v3 no longer injects `SET LOCAL` at all; `statement_timeout` moved to DSN level per rule 4).
 3. **Subquery traversal**: walk the full AST (including CTEs and subqueries); deny any non-SELECT node anywhere.
-4. **`statement_timeout` enforcement**: **at DSN level**, not via SQL `SET LOCAL`. The connection string includes `options='-c statement_timeout=10000'` (configurable via `Settings.statement_timeout_seconds`). SQL-side `SET LOCAL statement_timeout` is no longer trusted (an LLM can write `RESET statement_timeout` to bypass it).
+4. **`statement_timeout` enforcement**: **at DSN level**, not via SQL `SET LOCAL`. The connection string includes `options='-c statement_timeout=10000'` (configurable via `Settings.statement_timeout_seconds`; SDK multiplies by 1000 for PG's millisecond unit). SQL-side `SET LOCAL statement_timeout` is no longer trusted (an LLM can write `RESET statement_timeout` to bypass it).
+5. **`LIMIT` injection**: if a SELECT has no `LIMIT` clause, append `LIMIT <row_limit>`; if it has `LIMIT > row_limit`, truncate to `row_limit`.
+6. **Read-only DB user**: SDK connects with a DB user that has `SELECT`-only grants; documented in README setup. Enforced via `SET ROLE` check at init (probe query).
+7. **Fail-closed**: if `sqlglot.parse_one` raises (unparseable SQL), log + reject; never execute.
+8. **Multi-statement behavior** (v3, added per Round-3 architecture review M-1): `sqlglot.parse_one()` only parses the first statement; any subsequent statements (e.g., `SELECT 1; DROP TABLE users`) are silently dropped by the AST-based rewrite. This is a **defense-in-depth benefit** (malicious tail statements are stripped) but also a **functional limitation**: multi-statement SQL is not supported, and the LLM will not receive an error if it generates multi-statement SQL — the trailing statements are silently ignored. Documented in tool descriptions to set LLM expectations.
 5. **`LIMIT` injection**: if a SELECT has no `LIMIT` clause, append `LIMIT <row_limit>`; if it has `LIMIT > row_limit`, truncate to `row_limit`.
 6. **Read-only DB user**: SDK connects with a DB user that has `SELECT`-only grants; documented in README setup. Enforced via `SET ROLE` check at init (probe query).
 7. **Fail-closed**: if `sqlglot.parse_one` raises (unparseable SQL), log + reject; never execute.
@@ -528,8 +545,8 @@ The 3-person team framing in the brainstorm was project-shape language, not staf
 
 | Week | Deliverable | Gate criteria |
 |------|-------------|---------------|
-| W1 | `pyproject.toml` synced (AC-18); `Settings` + `DataAnalyst.__init__` + `PostgresBackend` (concrete) + sandbox (allow-list, 16+ banned constructs) + redaction defaults (AC-19) + concurrency scaffolding | AC-1, AC-2, AC-17, AC-18, AC-19 pass; sandbox rejects 16+ banned constructs; `statement_timeout` works via DSN on real PG |
-| W2 | **3 tools** (`list_tables`, `execute_sql`, `explain_plan`) with Pydantic schemas; `LLMClient` Protocol + `AnthropicClient`; Agent loop with `max_iter=8` + circuit breaker; failure injection tests | AC-6, AC-7 (3 tools, not 4), AC-8, AC-16 pass; mock LLM tests green; `pytest --asyncio-mode=auto` clean |
+| W1 | `pyproject.toml` synced (AC-18); `Settings` + `DataAnalyst.__init__` + `PostgresBackend` (concrete) + sandbox (allow-list, 16+ banned constructs) + concurrency scaffolding. **Redaction deferred to W2** (v3 change per Round-2 H-2: redaction is naturally co-located with the tool layer that consumes rows, not the executor layer that owns connections — moving AC-19 out of W1 brings W1 load from 6-7 → 5-6 person-days). | AC-1, AC-2, AC-17, AC-18 pass; sandbox rejects 16+ banned constructs; `statement_timeout` works via DSN on real PG |
+| W2 | **3 tools** (`list_tables`, `execute_sql`, `explain_plan`) with Pydantic schemas; **redaction layer** (AC-19, moved from W1) co-located with `execute_sql` post-processing; `LLMClient` Protocol + `AnthropicClient`; Agent loop with `max_iter=8` + circuit breaker; failure injection tests | AC-6, AC-7 (3 tools, not 4), AC-8, AC-16, AC-19 pass; mock LLM tests green; `pytest --asyncio-mode=auto` clean |
 | W3 | Demo dataset (`demo_db.sql` 10 tables + 10k rows); 30-question set `questions.yaml` with expected shapes; `eval.py` + `eval_normalizer.py` (with unit tests). **Two-part gate** (replaces v2 false-positive smoke run, per Round-2 NEW-C-3):<br>(a) Mock-LLM pipeline validation: 15 deterministic questions, expect 15/15 (validates plumbing only)<br>(b) Real-LLM accuracy baseline: 5 representative questions × 1 run at temp=0; gate = **≥ 60% accuracy** (NOT 80%) | AC-9 pass with mock LLM (15/15 deterministic); real-LLM baseline ≥ 60% on 5-question sample; if baseline < 60%, **STOP and iterate on prompt + glossary before W4** — do not proceed hoping W4 tuning fixes structural prompt issues |
 | W4 | First full real-LLM eval run on 30 questions × 3 runs; per-tier accuracy baseline; prompt / glossary iteration; failure-mode analysis drafted | AC-10 reached (≥ 80% overall, ≥ 90% easy, ≥ 60% hard) OR plan-B triggered (see Risk Register R4); if accuracy > 10pp below any threshold at end of W4, **escalate to user before W5** (do not silently push to W6) |
 | W5 | Latency optimization (warm pool, cache hit ratio); **concurrency hardening** (AC-20 — 5 parallel `ask()` calls share pool without deadlock); metrics report (`docs/metrics-report.md`) **first complete draft** (all 5 sections, content roughly final); `examples/demo.py` skeleton (AC-15 lint scope creeps in here, not W6) | AC-11 (cold/warm latency split) pass; AC-20 (concurrency) pass; AC-13 metrics report has all 5 H2 sections, each ≥ 100 words (draft quality); AC-15 mypy + ruff clean |
@@ -577,7 +594,7 @@ The 3-person team framing in the brainstorm was project-shape language, not staf
 2. **PostgreSQL-only in prototype** — Resolution of inbox #1.
 3. **EX (execution accuracy) over SQL string equality** — Industry standard (Spider/BIRD). Eval normalizer handles float tolerance, NULL semantics, datetime normalization, column-name alignment, unordered row comparison.
 4. **Tier 1 schema injection only** — Resolution of inbox #4. Tier 2 (on-demand tool) deferred because 10-table demo can't exercise it (always Tier 1); building it would be untested code.
-5. **6-week time-box** — Resolution of inbox #6. Stage-4 review (Reviewer 2) estimated 27-50 person-days realistic effort; 4 weeks was 12 person-days, infeasible. 6 weeks (≈18 person-days at realistic utilization) fits the lower bound while preserving scope. Replaces v1's "fall back to easier question set" mitigation (which was a hidden AC downgrade).
+5. **6-week time-box, single-developer** — Resolution of inbox #6. Stage-4 review (Reviewer 2) estimated 27-50 person-days realistic effort for a 3-person team; reframed in v3 as **single-developer prototype**: 6 weeks × 5 working days = 30 person-days capacity, task estimate 28-34 person-days (bottom-up: W1 5-6, W2 6-7, W3 6-7, W4 5-6, W5 5-6, W6 2-3 + buffer), buffer 0-2 days tight. The 3-person framing in brainstorm was project-shape language, not staffing. W6's 2-3 day bug buffer absorbs overrun from earlier weeks; if exhausted by W4 gate, escalate (R8). Replaces v1's "fall back to easier question set" mitigation (which was a hidden AC downgrade) and v2's "18 person-days" math (units error corrected in v3).
 6. **80% accuracy with confidence interval** — Resolution of inbox #2. v2 specifies: **3 runs at temperature=0, report median**; per-tier thresholds (easy ≥90%, medium default, hard ≥60%) instead of a single brittle number. Resolves v1's "single-run gamble" issue.
 7. **No front-end chart rendering** — Resolution of inbox #5. SDK returns structured data only.
 8. **Multi-model routing DEFERRED** (v2 change) — Stage-4 consensus: ROI not justified for 30-question demo ($5-20 total LLM cost over 6 weeks; "30× cost saving" in Stage 1 research was output-token-only, real ratio ~3-4× on input). Router bugs risk lowering accuracy. Decision: prototype runs Sonnet 4.6 only; cost baseline reported in metrics report; router evaluated in a follow-up RFC if metrics warrant.
